@@ -1,0 +1,11 @@
+$text = [IO.File]::ReadAllText("src\main.cpp")
+$text = [regex]::Replace($text, "(?m)^// =+\r?\n//\s*(.*?)\r?\n//\s*(.*?)\r?\n// =+", "// `$1`r`n// `$2")
+$text = [regex]::Replace($text, "(?m)^// --- (.*?) -+", "// `$1")
+$text = [regex]::Replace($text, "(?m)^// -+\r?\n//\s*(.*?)\r?\n// -+", "// `$1")
+[IO.File]::WriteAllText("src\main.cpp", $text, [System.Text.Encoding]::UTF8)
+
+$text2 = [IO.File]::ReadAllText("src\AdbManager.cpp.cpp")
+$text2 = [regex]::Replace($text2, "(?m)^// =+\r?\n//\s*(.*?)\r?\n//\s*(.*?)\r?\n// =+", "// `$1`r`n// `$2")
+$text2 = [regex]::Replace($text2, "(?m)^// --- (.*?) -+", "// `$1")
+$text2 = [regex]::Replace($text2, "(?m)^// -+\r?\n//\s*(.*?)\r?\n// -+", "// `$1")
+[IO.File]::WriteAllText("src\AdbManager.cpp.cpp", $text2, [System.Text.Encoding]::UTF8)
