@@ -46,4 +46,4 @@ void DeviceManager::UpdateThread() {
 std::vector<DeviceInfo> DeviceManager::GetDevices() {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_devices;
-}
+}   

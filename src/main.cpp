@@ -1,3 +1,10 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <stack>
 #include "AdbManager.hpp"
 #include "DeviceManager.hpp"
 #include "imgui.h"
@@ -12,6 +19,8 @@
 #include <tchar.h>
 #include <thread>
 #include <vector>
+#include <ctime>
+#include <algorithm>
 
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
                                               WPARAM wParam, LPARAM lParam);
@@ -37,6 +46,26 @@ static const float kAdbCheckInterval = 5.0f;
 static std::string g_lastDetailedSerial;
 static DeviceInfo  g_cachedDetails;
 
+// File Manager State
+static std::string g_currentPath = "/storage/emulated/0";
+static std::vector<FileEntry> g_fileList;
+static std::stack<std::string> g_pathHistory;
+static bool g_fileListLoading = false;
+static bool g_rootMode = false;
+static bool g_showRootWarning = false;
+static std::string g_selectedFile;
+static bool g_showConflictPopup = false;
+static std::string g_conflictLocalPath;
+static std::string g_conflictRemotePath;
+
+// Modal States
+static bool g_showRenamePopup = false;
+static bool g_showDeletePopup = false;
+static bool g_showNewFolderPopup = false;
+static char g_nameBuffer[256] = "";
+static char g_fileSearchQuery[128] = "";
+static std::string g_actionTarget; // The file/folder being acted upon
+
 // Fonts 
 static ImFont *g_fontRegular = nullptr;
 static ImFont *g_fontBold = nullptr;
@@ -47,6 +76,48 @@ void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// --- NATIVE HELPERS ---
+static std::string PickLocalFile() {
+    char szFile[MAX_PATH] = { 0 };
+    OPENFILENAMEA ofn = { sizeof(ofn) };
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn)) return szFile;
+    return "";
+}
+
+static std::string SaveLocalFile(const std::string& defaultName) {
+    char szFile[MAX_PATH] = { 0 };
+    strncpy_s(szFile, defaultName.c_str(), _TRUNCATE);
+    OPENFILENAMEA ofn = { sizeof(ofn) };
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameA(&ofn)) return szFile;
+    return "";
+}
+
+// --- UI COMPONENTS ---
+static void DrawFolderIcon(ImDrawList* dl, ImVec2 pos, float size) {
+    ImU32 col = IM_COL32(243, 156, 18, 255);
+    float w = size * 0.8f;
+    float h = size * 0.6f;
+    // Tab
+    dl->AddRectFilled(ImVec2(pos.x, pos.y - 2.0f), ImVec2(pos.x + w * 0.4f, pos.y), col, 2.0f);
+    // Body
+    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), col, 2.0f);
+}
+
+static void DrawFileIcon(ImDrawList* dl, ImVec2 pos, float size) {
+    ImU32 col = IM_COL32(189, 195, 199, 255);
+    float w = size * 0.6f;
+    float h = size * 0.8f;
+    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), col, 1.0f);
+    // Fold
+    dl->AddTriangleFilled(ImVec2(pos.x + w - 4.0f, pos.y), ImVec2(pos.x + w, pos.y + 4.0f), ImVec2(pos.x + w, pos.y), IM_COL32(40, 40, 50, 255));
+}
 
 // THEME
 static void ApplyWallETheme() {
@@ -380,24 +451,264 @@ static void RenderHomePanel(const std::vector<DeviceInfo>& devices, float panelW
 }
 
 
-//  COMING SOON PANEL
-static void RenderComingSoonPanel(const char *title, float panelW,
-                                  float panelH) {
+// FILE MANAGER PANEL
+static void RenderFilePanel(const std::vector<DeviceInfo> &devices, float panelW, float panelH) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 20.0f));
+    ImGui::BeginChild("##file_panel", ImVec2(panelW, panelH), false);
+    ImGui::PopStyleVar();
+
+    if (devices.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Connect a device to browse files.");
+        ImGui::EndChild();
+        return;
+    }
+
+    const DeviceInfo& dev = devices[0];
+
+    // --- Header / Toolbar ---
+    if (g_fontBold) ImGui::PushFont(g_fontBold);
+    ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "[ Files ]");
+    if (g_fontBold) ImGui::PopFont();
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 140.0f);
+    if (ImGui::Checkbox("Root Access", &g_rootMode)) {
+        if (g_rootMode) {
+            g_rootMode = false; // reset until warning accepted
+            g_showRootWarning = true;
+        }
+    }
+
+    ImGui::SetCursorPos(ImVec2(24.0f, 55.0f));
+    if (ImGui::Button("Back") && g_currentPath != "/") {
+        size_t lastSlash = g_currentPath.find_last_of('/');
+        if (lastSlash != std::string::npos) {
+            if (lastSlash == 0) g_currentPath = "/";
+            else g_currentPath = g_currentPath.substr(0, lastSlash);
+            g_fileListLoading = false;
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(panelW - 320.0f);
+    char pathBuf[512];
+    strncpy_s(pathBuf, g_currentPath.c_str(), _TRUNCATE);
+    if (ImGui::InputText("##curpath", pathBuf, sizeof(pathBuf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        g_currentPath = pathBuf;
+        g_fileListLoading = false;
+    }
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 200.0f);
+    if (ImGui::Button("New Folder")) {
+        g_nameBuffer[0] = '\0';
+        g_showNewFolderPopup = true;
+    }
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 90.0f);
+    if (ImGui::Button("Refresh")) g_fileListLoading = false;
+
+    // --- Fetch Logic ---
+    if (!g_fileListLoading) {
+        g_fileList = AdbManager::ListFiles(dev.serial, g_currentPath, g_rootMode);
+        g_fileListLoading = true;
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
+
+    // --- Table ---
+    if (ImGui::BeginTable("##file_table", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable, ImVec2(0, panelH - 180.0f))) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+        ImGui::TableHeadersRow();
+
+        int rowIdx = 0;
+        for (const auto& file : g_fileList) {
+            // Search Filter
+            if (g_fileSearchQuery[0] != '\0') {
+                std::string nameLower = file.name;
+                std::string searchLower = g_fileSearchQuery;
+                std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+                std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::tolower);
+                if (nameLower.find(searchLower) == std::string::npos) continue;
+            }
+
+            ImGui::PushID(rowIdx++);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            
+            // Icon + Label
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 cp = ImGui::GetCursorScreenPos();
+            if (file.isDirectory) DrawFolderIcon(dl, ImVec2(cp.x, cp.y + 4.0f), 16.0f);
+            else DrawFileIcon(dl, ImVec2(cp.x, cp.y + 4.0f), 16.0f);
+            
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+            bool selected = (g_selectedFile == file.name);
+            const char* label = file.name.empty() ? "[Unnamed]" : file.name.c_str();
+            if (ImGui::Selectable(label, selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                g_selectedFile = file.name;
+                if (file.isDirectory && ImGui::IsMouseDoubleClicked(0)) {
+                    g_pathHistory.push(g_currentPath);
+                    if (g_currentPath.back() != '/') g_currentPath += "/";
+                    g_currentPath += file.name;
+                    g_fileListLoading = false;
+                    g_selectedFile = "";
+                }
+            }
+
+            // --- Context Menu ---
+            if (ImGui::BeginPopupContextItem()) {
+                g_selectedFile = file.name;
+                if (ImGui::MenuItem("Download")) {
+                    std::string local = SaveLocalFile(file.name);
+                    if (!local.empty()) AdbManager::PullFile(dev.serial, g_currentPath + "/" + file.name, local);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Rename")) {
+                    g_actionTarget = file.name;
+                    strncpy_s(g_nameBuffer, file.name.c_str(), _TRUNCATE);
+                    g_showRenamePopup = true;
+                }
+                if (ImGui::MenuItem("Delete", nullptr, false, true)) {
+                    g_actionTarget = file.name;
+                    g_showDeletePopup = true;
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%s", file.size.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%s", file.date.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // --- Action Bar ---
+    ImGui::SetCursorPos(ImVec2(24.0f, panelH - 50.0f));
+    if (ImGui::Button("Download") && !g_selectedFile.empty()) {
+        std::string local = SaveLocalFile(g_selectedFile);
+        if (!local.empty()) {
+            std::string remote = g_currentPath + "/" + g_selectedFile;
+            AdbManager::PullFile(dev.serial, remote, local);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Upload")) {
+        std::string local = PickLocalFile();
+        if (!local.empty()) {
+            size_t slash = local.find_last_of("\\/");
+            std::string filename = (slash != std::string::npos) ? local.substr(slash + 1) : local;
+            std::string remote = g_currentPath + "/" + filename;
+            
+            if (AdbManager::Exists(dev.serial, remote, g_rootMode)) {
+                g_conflictLocalPath = local;
+                g_conflictRemotePath = remote;
+                g_showConflictPopup = true;
+            } else {
+                AdbManager::PushFile(dev.serial, local, remote);
+                g_fileListLoading = false;
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 220.0f);
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::InputTextWithHint("##search", "Search...", g_fileSearchQuery, sizeof(g_fileSearchQuery));
+
+    // --- Popups ---
+    if (g_showRootWarning) ImGui::OpenPopup("Root Safety Warning");
+    if (ImGui::BeginPopupModal("Root Safety Warning", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("WARNING: Root mode allows absolute power over the device.");
+        ImGui::Text("(Note: Device must be rooted for this to work)");
+        ImGui::Text("Incorrect actions can brick the OS or delete critical data.");
+        ImGui::Separator();
+        if (ImGui::Button("Accept Risk", ImVec2(120, 0))) { g_rootMode = true; g_showRootWarning = false; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { g_showRootWarning = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    if (g_showConflictPopup) ImGui::OpenPopup("File Conflict");
+    if (ImGui::BeginPopupModal("File Conflict", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("The file already exists on the device.");
+        ImGui::Separator();
+        if (ImGui::Button("Overwrite")) {
+            AdbManager::PushFile(dev.serial, g_conflictLocalPath, g_conflictRemotePath);
+            g_showConflictPopup = false; g_fileListLoading = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rename")) {
+            // Simple rename: append timestamp
+            std::string r = g_conflictRemotePath + "_" + std::to_string(time(NULL));
+            AdbManager::PushFile(dev.serial, g_conflictLocalPath, r);
+            g_showConflictPopup = false; g_fileListLoading = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Skip")) { g_showConflictPopup = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    if (g_showRenamePopup) ImGui::OpenPopup("Rename Item");
+    if (ImGui::BeginPopupModal("Rename Item", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Enter new name for: %s", g_actionTarget.c_str());
+        ImGui::InputText("##newname", g_nameBuffer, sizeof(g_nameBuffer));
+        ImGui::Separator();
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            AdbManager::RenameEntry(dev.serial, g_currentPath + "/" + g_actionTarget, g_currentPath + "/" + g_nameBuffer, g_rootMode);
+            g_showRenamePopup = false; g_fileListLoading = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { g_showRenamePopup = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    if (g_showDeletePopup) ImGui::OpenPopup("Confirm Delete");
+    if (ImGui::BeginPopupModal("Confirm Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Are you sure you want to delete '%s'?", g_actionTarget.c_str());
+        ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "This action cannot be undone.");
+        ImGui::Separator();
+        if (ImGui::Button("Delete", ImVec2(120, 0))) {
+            AdbManager::DeleteEntry(dev.serial, g_currentPath + "/" + g_actionTarget, g_rootMode);
+            g_showDeletePopup = false; g_fileListLoading = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { g_showDeletePopup = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    if (g_showNewFolderPopup) ImGui::OpenPopup("New Folder");
+    if (ImGui::BeginPopupModal("New Folder", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Enter folder name:");
+        ImGui::InputText("##foldername", g_nameBuffer, sizeof(g_nameBuffer));
+        ImGui::Separator();
+        if (ImGui::Button("Create", ImVec2(120, 0))) {
+            AdbManager::CreateDirectory(dev.serial, g_currentPath + "/" + g_nameBuffer, g_rootMode);
+            g_showNewFolderPopup = false; g_fileListLoading = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { g_showNewFolderPopup = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
+}
+
+static void RenderComingSoonPanel(const char *title, float panelW, float panelH) {
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
   ImGui::BeginChild("##cs_panel", ImVec2(panelW, panelH), false);
   ImGui::PopStyleVar();
-
-  if (g_fontBold)
-    ImGui::PushFont(g_fontBold);
+  if (g_fontBold) ImGui::PushFont(g_fontBold);
   ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "%s", title);
-  if (g_fontBold)
-    ImGui::PopFont();
-
+  if (g_fontBold) ImGui::PopFont();
   float cX = (panelW * 0.5f) - 80.0f;
   float cY = (panelH * 0.44f);
   ImGui::SetCursorPos(ImVec2(cX, cY));
   ImGui::TextColored(ImVec4(0.28f, 0.28f, 0.38f, 1.0f), "Coming soon");
-
   ImGui::EndChild();
 }
 
@@ -597,20 +908,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
                           ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
 
-    switch (g_activeTab) {
-    case 0:
-      RenderHomePanel(devices, panelW, contentH);
-      break;
-    case 1:
-      RenderComingSoonPanel("File Manager", panelW, contentH);
-      break;
-    case 2:
-      RenderComingSoonPanel("Backup & Restore", panelW, contentH);
-      break;
-    case 3:
-      RenderComingSoonPanel("Settings", panelW, contentH);
-      break;
-    }
+    if (g_activeTab == 0) RenderHomePanel(devices, panelW, contentH);
+    else if (g_activeTab == 1) RenderFilePanel(devices, panelW, contentH);
+    else if (g_activeTab == 2) RenderComingSoonPanel("Backup & Restore", panelW, contentH);
+    else if (g_activeTab == 3) RenderComingSoonPanel("Wall-E Settings", panelW, contentH);
 
     ImGui::EndChild();
     

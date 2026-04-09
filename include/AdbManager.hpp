@@ -28,12 +28,29 @@ struct DeviceInfo {
     bool detailsLoaded = false;
 };
 
+struct FileEntry {
+    std::string name;
+    std::string size;
+    std::string date;
+    std::string permissions;
+    bool isDirectory;
+};
+
 class AdbManager {
 public:
     static bool Initialize(const std::string& adbPath = "");
     static void KillServer();
     static std::vector<DeviceInfo> GetDevices();
     static void GetDeviceDetails(DeviceInfo& dev);
+
+    // File Management
+    static std::vector<FileEntry> ListFiles(const std::string& serial, const std::string& path, bool useRoot = false);
+    static bool Exists(const std::string& serial, const std::string& path, bool useRoot = false);
+    static bool PushFile(const std::string& serial, const std::string& localPath, const std::string& remotePath);
+    static bool PullFile(const std::string& serial, const std::string& remotePath, const std::string& localPath);
+    static bool CreateDirectory(const std::string& serial, const std::string& path, bool useRoot = false);
+    static bool DeleteEntry(const std::string& serial, const std::string& path, bool useRoot = false);
+    static bool RenameEntry(const std::string& serial, const std::string& oldPath, const std::string& newPath, bool useRoot = false);
 
 private:
     static std::string m_adbPath;

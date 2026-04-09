@@ -77,29 +77,42 @@ std::vector<DeviceInfo> AdbManager::GetDevices() {
 
     bool firstLine = true;
     while (std::getline(stream, line)) {
-        if (firstLine) { firstLine = false; continue; }
+        if (firstLine) {
+            firstLine = false;
+            continue;
+        }
+
         if (line.empty()) continue;
 
         DeviceInfo info;
         std::istringstream lineStream(line);
         lineStream >> info.serial >> info.status;
 
-        if (info.status != "device" && info.status != "offline" && info.status != "unauthorized")
-            continue;
+        if (info.serial.empty()) continue;
 
-        // Parse model from "model:XXX"
+        // Check connection type
+        bool isUSB = false;
         std::string token;
-        while (lineStream >> token) {
+        while (lineStream >> token) { 
+            if (token.find("usb:") != std::string::npos ||
+                token.find("product:") != std::string::npos) {
+                isUSB = true;
+            }
             if (token.find("model:") == 0) {
                 info.model = token.substr(6);
-                // Replace underscores with spaces for cleaner display
-                std::replace(info.model.begin(), info.model.end(), '_', ' ');
             }
         }
 
-        if (info.model.empty()) info.model = "Unknown Device";
+        // Skip wireless devices (no USB connection detected)
+        if (!isUSB) {
+            continue;
+        }
 
-        devices.push_back(info);
+        if (info.model.empty()) info.model = "Unknown";
+
+        if (info.status == "device") {
+            devices.push_back(info);
+        }
     }
 
     return devices;
@@ -195,4 +208,123 @@ void AdbManager::GetDeviceDetails(DeviceInfo& dev) {
     dev.ramAvail = memField("MemAvailable");
 
     dev.detailsLoaded = true;
+}
+
+std::vector<FileEntry> AdbManager::ListFiles(const std::string& serial, const std::string& path, bool useRoot) {
+    std::vector<FileEntry> files;
+    std::string cmd = m_adbPath + " -s " + serial + " shell ";
+    if (useRoot) cmd = cmd + "su -c \"ls -la " + path + "\"";
+    else cmd += "ls -la " + path;
+
+    std::string output = Execute(cmd);
+    std::istringstream stream(output);
+    std::string line;
+
+    while (std::getline(stream, line)) {
+        line = Trim(line);
+        if (line.empty() || line.find("total ") == 0) continue;
+        if (line.find("permission denied") != std::string::npos || line.find("Permission denied") != std::string::npos) continue;
+
+        // --- NEW Pivot-Based Parser ---
+        std::vector<std::string> tokens;
+        std::istringstream ls(line);
+        std::string t;
+        while (ls >> t) tokens.push_back(t);
+
+        if (tokens.size() < 4) continue;
+
+        // Find the "Time" token (e.g., "17:06" or "12:03") to use as an anchor.
+        // Toybox usually has perms, links, owner, group, size, date, time, name.
+        // But columns can be missing. The time is almost always the 7th or 8th token.
+        int timeIdx = -1;
+        for (int i = 0; i < (int)tokens.size(); ++i) {
+            if (tokens[i].find(':') != std::string::npos && tokens[i].length() >= 3 && isdigit(tokens[i][0])) {
+                timeIdx = i;
+                break;
+            }
+        }
+
+        if (timeIdx == -1) continue;
+
+        // Name is everything after the time token. 
+        // We find where the time token ends in the raw line to capture the name with original spacing.
+        size_t namePos = line.find(tokens[timeIdx]);
+        if (namePos != std::string::npos) {
+            namePos += tokens[timeIdx].length();
+            while (namePos < line.length() && (line[namePos] == ' ' || line[namePos] == '\t')) namePos++;
+        }
+        
+        std::string name = (namePos != std::string::npos && namePos < line.length()) ? line.substr(namePos) : tokens.back();
+        if (name == "." || name == "..") continue;
+
+        FileEntry fe;
+        fe.name = name;
+        fe.permissions = tokens[0];
+        fe.isDirectory = (fe.permissions[0] == 'd' || fe.permissions[0] == 'l');
+        
+        // Size is typically 2 tokens before time (links owner group size date time)
+        // Adjust for toybox: date is at timeIdx-1, size is at timeIdx-2
+        std::string sizeStr = (timeIdx >= 2) ? tokens[timeIdx - 2] : "0";
+        fe.size = fe.isDirectory ? "--" : sizeStr;
+
+        if (!fe.isDirectory) {
+            try {
+                long long s = std::stoll(sizeStr);
+                char buf[64];
+                if      (s > 1024LL * 1024 * 1024) snprintf(buf, sizeof(buf), "%.2f GB", s / (1024.0f * 1024 * 1024));
+                else if (s > 1024LL * 1024)        snprintf(buf, sizeof(buf), "%.2f MB", s / (1024.0f * 1024));
+                else if (s > 1024LL)               snprintf(buf, sizeof(buf), "%.2f KB", s / 1024.0f);
+                else                               snprintf(buf, sizeof(buf), "%lld B", s);
+                fe.size = buf;
+            } catch (...) { fe.size = sizeStr; }
+        }
+
+        fe.date = tokens[timeIdx - 1] + " " + tokens[timeIdx];
+        files.push_back(fe);
+    }
+
+    return files;
+}
+
+bool AdbManager::Exists(const std::string& serial, const std::string& path, bool useRoot) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell ";
+    if (useRoot) cmd = cmd + "su -c \"[ -e '" + path + "' ] && echo 1 || echo 0\"";
+    else cmd += "[ -e \"" + path + "\" ] && echo 1 || echo 0";
+    return Execute(cmd).find('1') != std::string::npos;
+}
+
+bool AdbManager::PushFile(const std::string& serial, const std::string& localPath, const std::string& remotePath) {
+    std::string cmd = m_adbPath + " -s " + serial + " push \"" + localPath + "\" \"" + remotePath + "\"";
+    std::string res = Execute(cmd);
+    return res.find("pushed") != std::string::npos;
+}
+
+bool AdbManager::PullFile(const std::string& serial, const std::string& remotePath, const std::string& localPath) {
+    std::string cmd = m_adbPath + " -s " + serial + " pull \"" + remotePath + "\" \"" + localPath + "\"";
+    std::string res = Execute(cmd);
+    return res.find("pulled") != std::string::npos;
+}
+
+bool AdbManager::CreateDirectory(const std::string& serial, const std::string& path, bool useRoot) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell ";
+    if (useRoot) cmd = cmd + "su -c \"mkdir -p '" + path + "'\"";
+    else cmd += "mkdir -p \"" + path + "\"";
+    Execute(cmd);
+    return true; 
+}
+
+bool AdbManager::DeleteEntry(const std::string& serial, const std::string& path, bool useRoot) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell ";
+    if (useRoot) cmd = cmd + "su -c \"rm -rf '" + path + "'\"";
+    else cmd += "rm -rf \"" + path + "\"";
+    Execute(cmd);
+    return true;
+}
+
+bool AdbManager::RenameEntry(const std::string& serial, const std::string& oldPath, const std::string& newPath, bool useRoot) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell ";
+    if (useRoot) cmd = cmd + "su -c \"mv '" + oldPath + "' '" + newPath + "'\"";
+    else cmd += "mv \"" + oldPath + "\" \"" + newPath + "\"";
+    Execute(cmd);
+    return true;
 }
