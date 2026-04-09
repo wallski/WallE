@@ -8,7 +8,7 @@
 
 - **Device Diagnostics**: Real-time monitoring of battery health, storage metrics, RAM usage, and system specifications.
 - **Advanced File Manager**: 
-  - Full support for Upload, Download (Pull), Rename, and Delete.
+  - Full support for Upload, Download, Rename, and Delete.
   - Interactive breadcrumb navigation and parent-directory hopping.
   - Real-time search filtering for large file lists.
   - Custom vector iconography for a crisp, high-DPI UI.
