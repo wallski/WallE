@@ -6,7 +6,7 @@
 #include <vector>
 #include <algorithm>
 
-std::string AdbManager::m_adbPath = "adb";
+std::string AdbManager::m_adbPath = ".\\platform-tools\\adb.exe";
 
 bool AdbManager::Initialize(const std::string& adbPath) {
     if (!adbPath.empty()) {
