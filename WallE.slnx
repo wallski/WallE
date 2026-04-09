@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="WallE.vcxproj" />
+  <Project Path="WallE.vcxproj" Id="f3e2b3cf-57b0-4e02-9061-3512ba109112" />
 </Solution>
