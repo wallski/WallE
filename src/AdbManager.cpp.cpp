@@ -424,10 +424,105 @@ bool AdbManager::InstallApp(const std::string& serial, const std::string& localP
     return res.find("Success") != std::string::npos;
 }
 
+std::string AdbManager::ExecuteShell(const std::string& serial, const std::string& command, std::string& inOutCwd) {
+    std::string finalCmd = command;
+    // Alias ls to ls -CF if it's just 'ls'
+    if (finalCmd == "ls") finalCmd = "ls -CF";
+    else if (finalCmd.substr(0, 3) == "ls ") {
+        if (finalCmd.find(" -") == std::string::npos) finalCmd = "ls -CF " + finalCmd.substr(3);
+    }
+
+    // Wrap path in quotes to handle spaces. NO parentheses (avoids subshell directory reset)
+    std::string fullCmd = m_adbPath + " -s " + serial + " shell \"cd \\\"" + inOutCwd + "\\\" && " + finalCmd + " && pwd\"";
+    std::string output = Execute(fullCmd);
+    
+    if (output.empty()) return "";
+
+    std::stringstream ss(output);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(ss, line)) {
+        std::string trimmed = Trim(line);
+        if (!trimmed.empty()) lines.push_back(trimmed);
+    }
+
+    if (lines.empty()) return "";
+
+    // The last non-empty line should be our new PWD ONLY if it starts with / (valid path)
+    std::string last = lines.back();
+    if (last[0] == '/') {
+        inOutCwd = last;
+        lines.pop_back(); // Remove CWD from display output
+    }
+
+    std::string result = "";
+    for (const auto& l : lines) {
+        result += l + "\n";
+    }
+
+    return result;
+}
+
+std::vector<std::string> AdbManager::GetCompletions(const std::string& serial, const std::string& prefix, const std::string& cwd) {
+    if (prefix.empty()) return {};
+
+    std::string fullPath;
+    if (prefix[0] == '/') fullPath = prefix + "*";
+    else fullPath = cwd + (cwd.back() == '/' ? "" : "/") + prefix + "*";
+
+    std::string cmd = m_adbPath + " -s " + serial + " shell \"ls -ad " + fullPath + " 2>/dev/null\"";
+    std::string output = Execute(cmd);
+    
+    std::vector<std::string> results;
+    std::stringstream ss(output);
+    std::string line;
+    while (std::getline(ss, line)) {
+        line = Trim(line);
+        if (!line.empty()) {
+            // If it's a directory, adding / is helpful (we check with ls -d .../)
+            // For simplicity, we just take the result
+            size_t lastSlash = line.find_last_of('/');
+            if (lastSlash != std::string::npos) {
+                results.push_back(line.substr(lastSlash + 1));
+            } else {
+                results.push_back(line);
+            }
+        }
+    }
+    return results;
+}
+
 bool AdbManager::PushFile(const std::string& serial, const std::string& localPath, const std::string& remotePath) {
     std::string cmd = m_adbPath + " -s " + serial + " push \"" + localPath + "\" \"" + remotePath + "\"";
     std::string res = Execute(cmd);
     return res.find("pushed") != std::string::npos;
+}
+
+AdbManager::WallFetchData AdbManager::GetWallFetchData(const std::string& serial) {
+    WallFetchData data = {"Unknown", "Unknown", "Unknown", "Unknown", "Unknown"};
+    
+    // Model & OS
+    data.model = Execute(m_adbPath + " -s " + serial + " shell getprop ro.product.model");
+    data.androidVer = Execute(m_adbPath + " -s " + serial + " shell getprop ro.build.version.release");
+    data.model = Trim(data.model);
+    data.androidVer = Trim(data.androidVer);
+
+    // Battery
+    std::string battRaw = Execute(m_adbPath + " -s " + serial + " shell \"dumpsys battery | grep level\"");
+    size_t colon = battRaw.find(':');
+    if (colon != std::string::npos) data.battery = Trim(battRaw.substr(colon + 1)) + "%";
+
+    // Storage (Simplified for /sdcard)
+    std::string storageRaw = Execute(m_adbPath + " -s " + serial + " shell \"df -h /sdcard | tail -1\"");
+    std::stringstream ss(storageRaw);
+    std::string filesystem, size, used, avail, percent;
+    ss >> filesystem >> size >> used >> avail >> percent;
+    if (!avail.empty()) data.storage = avail + " free / " + size;
+
+    // Kernel
+    data.kernel = Trim(Execute(m_adbPath + " -s " + serial + " shell uname -r"));
+
+    return data;
 }
 
 bool AdbManager::PullFile(const std::string& serial, const std::string& remotePath, const std::string& localPath) {
@@ -436,7 +531,7 @@ bool AdbManager::PullFile(const std::string& serial, const std::string& remotePa
     return res.find("pulled") != std::string::npos;
 }
 
-bool AdbManager::CreateDirectory(const std::string& serial, const std::string& path, bool useRoot) {
+bool AdbManager::CreateRemoteDir(const std::string& serial, const std::string& path, bool useRoot) {
     std::string cmd = m_adbPath + " -s " + serial + " shell ";
     if (useRoot) cmd = cmd + "su -c \"mkdir -p '" + path + "'\"";
     else cmd += "mkdir -p \"" + path + "\"";

@@ -46,12 +46,21 @@ public:
         bool isSystem;
     };
 
+    struct WallFetchData {
+        std::string model;
+        std::string androidVer;
+        std::string battery;
+        std::string storage;
+        std::string kernel;
+    };
+
     static bool Initialize(const std::string& adbPath = "");
     static void KillServer();
     static std::string Execute(const std::string& command);
 
     static std::vector<DeviceInfo> GetDevices();
     static void GetDeviceDetails(DeviceInfo& dev);
+    static WallFetchData GetWallFetchData(const std::string& serial);
     
     // File Operations
     static std::vector<FileEntry> ListFiles(const std::string& serial, const std::string& path, bool useRoot = false);
@@ -59,7 +68,7 @@ public:
     static bool PushFile(const std::string& serial, const std::string& local, const std::string& remote);
     static bool DeleteEntry(const std::string& serial, const std::string& remote, bool isDirectory, bool useRoot = false);
     static bool RenameEntry(const std::string& serial, const std::string& oldPath, const std::string& newPath, bool useRoot = false);
-    static bool CreateDirectory(const std::string& serial, const std::string& path, bool useRoot = false);
+    static bool CreateRemoteDir(const std::string& serial, const std::string& path, bool useRoot = false);
     static bool Exists(const std::string& serial, const std::string& path, bool useRoot = false);
 
     // App Management
@@ -68,6 +77,8 @@ public:
     static bool GetAppDetails(const std::string& serial, const std::string& packageId, std::string& outVersion, std::string& outLabel);
     static bool LaunchApp(const std::string& serial, const std::string& packageId);
     static bool InstallApp(const std::string& serial, const std::string& localPath);
+    static std::string ExecuteShell(const std::string& serial, const std::string& command, std::string& inOutCwd);
+    static std::vector<std::string> GetCompletions(const std::string& serial, const std::string& prefix, const std::string& cwd);
 
 private:
     static std::string m_adbPath;
