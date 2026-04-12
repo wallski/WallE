@@ -9,9 +9,18 @@
 std::string AdbManager::m_adbPath = ".\\platform-tools\\adb.exe";
 
 bool AdbManager::Initialize(const std::string& adbPath) {
-    if (!adbPath.empty()) {
+    if (adbPath.empty()) {
+        // Find adb.exe relative to where WallE.exe is actually running
+        char buffer[MAX_PATH];
+        GetModuleFileNameA(NULL, buffer, MAX_PATH);
+        std::string fullPath = buffer;
+        size_t lastSlash = fullPath.find_last_of("\\/");
+        std::string dir = (lastSlash != std::string::npos) ? fullPath.substr(0, lastSlash) : ".";
+        m_adbPath = dir + "\\platform-tools\\adb.exe";
+    } else {
         m_adbPath = adbPath;
     }
+
     std::string result = Execute(m_adbPath + " version");
     return result.find("Android Debug Bridge") != std::string::npos;
 }
@@ -288,9 +297,131 @@ std::vector<FileEntry> AdbManager::ListFiles(const std::string& serial, const st
 
 bool AdbManager::Exists(const std::string& serial, const std::string& path, bool useRoot) {
     std::string cmd = m_adbPath + " -s " + serial + " shell ";
-    if (useRoot) cmd = cmd + "su -c \"[ -e '" + path + "' ] && echo 1 || echo 0\"";
-    else cmd += "[ -e \"" + path + "\" ] && echo 1 || echo 0";
-    return Execute(cmd).find('1') != std::string::npos;
+    if (useRoot) cmd += "su -c \"";
+    cmd += "ls -d " + path;
+    if (useRoot) cmd += "\"";
+
+    std::string result = Execute(cmd);
+    return result.find(path) != std::string::npos;
+}
+
+std::vector<AdbManager::AppInfo> AdbManager::ListApps(const std::string& serial, bool includeSystem) {
+    std::vector<AppInfo> apps;
+    
+    auto fetch = [&](const std::string& flags, bool system) {
+        std::string cmd = m_adbPath + " -s " + serial + " shell pm list packages -f " + flags;
+        std::string output = Execute(cmd);
+        std::stringstream ss(output);
+        std::string line;
+        while (std::getline(ss, line)) {
+            line = Trim(line);
+            if (line.empty()) continue;
+            
+            // Format: package:/data/app/.../base.apk=com.package.id
+            if (line.find("package:") == 0) {
+                size_t eq = line.find_last_of('=');
+                if (eq != std::string::npos) {
+                    AppInfo app;
+                    app.apkPath = line.substr(8, eq - 8);
+                    app.packageId = line.substr(eq + 1);
+                    app.isSystem = system;
+                    app.name = app.packageId; // Fallback
+                    app.version = "--";
+                    apps.push_back(app);
+                }
+            }
+        }
+    };
+
+    fetch("-3", false); // 3rd party
+    if (includeSystem) {
+        fetch("-s", true); // System
+    }
+
+    return apps;
+}
+
+bool AdbManager::UninstallApp(const std::string& serial, const std::string& packageId) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell pm uninstall " + packageId;
+    std::string res = Execute(cmd);
+    return res.find("Success") != std::string::npos;
+}
+
+bool AdbManager::GetAppDetails(const std::string& serial, const std::string& packageId, std::string& outVersion, std::string& outLabel) {
+    std::string cmd = m_adbPath + " -s " + serial + " shell dumpsys package " + packageId;
+    std::string output = Execute(cmd);
+    
+    // Find versionName
+    auto pos = output.find("versionName=");
+    if (pos != std::string::npos) {
+        auto eol = output.find('\n', pos);
+        outVersion = Trim(output.substr(pos + 12, eol - (pos + 12)));
+    } else {
+        outVersion = "Unknown";
+    }
+
+    // Attempt to find Label (rare in dumpsys but sometimes present in older or specific vendor builds)
+    auto lpos = output.find("label=");
+    if (lpos != std::string::npos) {
+        auto leol = output.find('\n', lpos);
+        outLabel = Trim(output.substr(lpos + 6, leol - (lpos + 6)));
+    } else {
+        // Fallback: Smart Prettify Package ID
+        // 1. Split by dots
+        std::vector<std::string> parts;
+        size_t start = 0, end = 0;
+        while ((end = packageId.find('.', start)) != std::string::npos) {
+            parts.push_back(packageId.substr(start, end - start));
+            start = end + 1;
+        }
+        parts.push_back(packageId.substr(start));
+
+        // 2. Identify core name
+        std::string rawName = "";
+        std::vector<std::string> ignore = { "android", "app", "apps", "mobile", "main", "play", "client", "service", "services", "internal" };
+        
+        if (parts.size() >= 3) {
+            std::string last = parts.back();
+            std::transform(last.begin(), last.end(), last.begin(), ::tolower);
+            bool isGeneric = false;
+            for(const auto& s : ignore) if(last == s) isGeneric = true;
+            
+            if (isGeneric) rawName = parts[parts.size() - 2];
+            else rawName = parts.back();
+        } else {
+            rawName = parts.back();
+        }
+
+        // 3. Format: Capitalize + Split CamelCase (ClashRoyale -> Clash Royale)
+        std::string pretty = "";
+        for (size_t i = 0; i < rawName.length(); ++i) {
+            if (i == 0) pretty += (char)toupper(rawName[i]);
+            else if (isupper(rawName[i]) && i > 0 && !isupper(rawName[i-1])) {
+                pretty += " ";
+                pretty += rawName[i];
+            } else if (rawName[i] == '_' || rawName[i] == '-') {
+                pretty += " ";
+            } else {
+                pretty += rawName[i];
+            }
+        }
+        outLabel = pretty;
+    }
+
+    return true;
+}
+
+bool AdbManager::LaunchApp(const std::string& serial, const std::string& packageId) {
+    // Launch using monkey (reliable for opening default launcher activity)
+    std::string cmd = m_adbPath + " -s " + serial + " shell monkey -p " + packageId + " -c android.intent.category.LAUNCHER 1";
+    Execute(cmd);
+    return true;
+}
+
+bool AdbManager::InstallApp(const std::string& serial, const std::string& localPath) {
+    std::string cmd = m_adbPath + " -s " + serial + " install -r \"" + localPath + "\"";
+    std::string res = Execute(cmd);
+    return res.find("Success") != std::string::npos;
 }
 
 bool AdbManager::PushFile(const std::string& serial, const std::string& localPath, const std::string& remotePath) {
@@ -313,7 +444,7 @@ bool AdbManager::CreateDirectory(const std::string& serial, const std::string& p
     return true; 
 }
 
-bool AdbManager::DeleteEntry(const std::string& serial, const std::string& path, bool useRoot) {
+bool AdbManager::DeleteEntry(const std::string& serial, const std::string& path, bool isDirectory, bool useRoot) {
     std::string cmd = m_adbPath + " -s " + serial + " shell ";
     if (useRoot) cmd = cmd + "su -c \"rm -rf '" + path + "'\"";
     else cmd += "rm -rf \"" + path + "\"";

@@ -21,6 +21,8 @@
 #include <vector>
 #include <ctime>
 #include <algorithm>
+#include <mutex>
+#include <atomic>
 
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
                                               WPARAM wParam, LPARAM lParam);
@@ -57,6 +59,18 @@ static std::string g_selectedFile;
 static bool g_showConflictPopup = false;
 static std::string g_conflictLocalPath;
 static std::string g_conflictRemotePath;
+
+// Apps Manager State
+static std::vector<AdbManager::AppInfo> g_appList;
+static bool g_appListLoading = false;
+static bool g_includeSystemApps = false;
+static char g_appSearchQuery[128] = "";
+static std::string g_selectedAppPackage;
+static bool g_showUninstallPopup = false;
+static std::atomic<bool> g_appResolverRunning{false};
+static std::mutex g_appMutex;
+static std::string g_appStatusMessage;
+static float g_appStatusTimer = 0.0f;
 
 // Modal States
 static bool g_showRenamePopup = false;
@@ -117,6 +131,36 @@ static void DrawFileIcon(ImDrawList* dl, ImVec2 pos, float size) {
     dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), col, 1.0f);
     // Fold
     dl->AddTriangleFilled(ImVec2(pos.x + w - 4.0f, pos.y), ImVec2(pos.x + w, pos.y + 4.0f), ImVec2(pos.x + w, pos.y), IM_COL32(40, 40, 50, 255));
+}
+
+static void DrawAppIcon(ImDrawList* dl, ImVec2 pos, const std::string& packageId, bool isSystem) {
+    float size = 20.0f;
+    // Generate a stable color from the packageId hash
+    size_t hash = std::hash<std::string>{}(packageId);
+    ImU32 col;
+    if (isSystem) {
+        col = IM_COL32(80, 80, 100, 255);
+    } else {
+        // Pick from a nice palette based on hash
+        ImU32 palette[] = {
+            IM_COL32(91, 110, 245, 255),  // Blue
+            IM_COL32(46, 204, 113, 255),  // Green
+            IM_COL32(155, 89, 182, 255),  // Purple
+            IM_COL32(231, 76, 60, 255),   // Red
+            IM_COL32(241, 196, 15, 255)   // Yellow
+        };
+        col = palette[hash % 5];
+    }
+
+    dl->AddRectFilled(pos, ImVec2(pos.x + size, pos.y + size), col, 6.0f);
+    
+    // Draw initial
+    char initial = packageId.empty() ? '?' : (char)toupper(packageId[packageId.find_last_of('.') + 1]);
+    if (!packageId.empty() && packageId.find('.') == std::string::npos) initial = (char)toupper(packageId[0]);
+    
+    char buf[2] = { initial, '\0' };
+    ImVec2 txtSize = ImGui::CalcTextSize(buf);
+    dl->AddText(ImVec2(pos.x + (size - txtSize.x)*0.5f, pos.y + (size - txtSize.y)*0.5f), IM_COL32(255,255,255,200), buf);
 }
 
 // THEME
@@ -239,7 +283,7 @@ static void RenderSidebar(int &activeTab, float sidebarW) {
               IM_COL32(42, 42, 56, 255));
 
   // Nav items
-  static const char *navLabels[] = {"Home", "Files", "Backup", "Settings"};
+  static const char *navLabels[] = {"Home", "Files", "Apps", "Settings"};
 
   float curY = 92.0f;
   for (int i = 0; i < 4; i++) {
@@ -296,7 +340,7 @@ static void RenderSidebar(int &activeTab, float sidebarW) {
 
   // Version footer
   ImGui::SetCursorPos(ImVec2(20.0f, contentH - 36.0f));
-  ImGui::TextColored(ImVec4(0.25f, 0.25f, 0.33f, 1.0f), "v0.1.0-alpha");
+  ImGui::TextColored(ImVec4(0.25f, 0.25f, 0.33f, 1.0f), "v1.0.0");
 
   ImGui::EndChild();
 }
@@ -698,18 +742,269 @@ static void RenderFilePanel(const std::vector<DeviceInfo> &devices, float panelW
     ImGui::EndChild();
 }
 
-static void RenderComingSoonPanel(const char *title, float panelW, float panelH) {
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
-  ImGui::BeginChild("##cs_panel", ImVec2(panelW, panelH), false);
-  ImGui::PopStyleVar();
-  if (g_fontBold) ImGui::PushFont(g_fontBold);
-  ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "%s", title);
-  if (g_fontBold) ImGui::PopFont();
-  float cX = (panelW * 0.5f) - 80.0f;
-  float cY = (panelH * 0.44f);
-  ImGui::SetCursorPos(ImVec2(cX, cY));
-  ImGui::TextColored(ImVec4(0.28f, 0.28f, 0.38f, 1.0f), "Coming soon");
-  ImGui::EndChild();
+static void RenderComingSoonPanel(const char* title, float panelW, float panelH) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
+    ImGui::BeginChild("##cs_panel", ImVec2(panelW, panelH), false);
+    ImGui::PopStyleVar();
+
+    if (g_fontBold) ImGui::PushFont(g_fontBold);
+    ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "%s", title);
+    if (g_fontBold) ImGui::PopFont();
+
+    float cX = (panelW * 0.5f) - 60.0f;
+    float cY = (panelH * 0.45f);
+    ImGui::SetCursorPos(ImVec2(cX, cY));
+    ImGui::TextColored(ImVec4(0.28f, 0.28f, 0.38f, 1.0f), "Coming soon");
+    ImGui::EndChild();
+}
+
+static void AppResolverThread(std::string serial) {
+    g_appResolverRunning = true;
+    
+    // We work on a copy of the pointers/indices to minimize lock time
+    std::vector<std::string> targetPackages;
+    {
+        std::lock_guard<std::mutex> lock(g_appMutex);
+        for (const auto& app : g_appList) targetPackages.push_back(app.packageId);
+    }
+
+    for (const auto& pkg : targetPackages) {
+        if (!g_appResolverRunning) break; // Check for cancellation signal
+
+        std::string version, label;
+        if (AdbManager::GetAppDetails(serial, pkg, version, label)) {
+            std::lock_guard<std::mutex> lock(g_appMutex);
+            for (auto& app : g_appList) {
+                if (app.packageId == pkg) {
+                    app.version = version;
+                    app.name = label;
+                    break;
+                }
+            }
+        }
+        // Small sleep to prevent ADB saturation
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    g_appResolverRunning = false;
+}
+
+static void RenderAppsPanel(const std::vector<DeviceInfo>& devices, float panelW, float panelH) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 20.0f));
+    ImGui::BeginChild("##apps_panel", ImVec2(panelW, panelH), false);
+    ImGui::PopStyleVar();
+
+    if (devices.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Connect a device to manage apps.");
+        ImGui::EndChild();
+        return;
+    }
+
+    const DeviceInfo& dev = devices[0];
+
+    // --- Header ---
+    if (g_fontBold) ImGui::PushFont(g_fontBold);
+    ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "[ App Manager ]");
+    if (g_fontBold) ImGui::PopFont();
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 200.0f);
+    if (ImGui::Checkbox("System Apps", &g_includeSystemApps)) {
+        g_appListLoading = false;
+    }
+
+    ImGui::SetCursorPos(ImVec2(24.0f, 55.0f));
+    ImGui::SetNextItemWidth(panelW - 140.0f);
+    ImGui::InputTextWithHint("##appsearch", "Search packages...", g_appSearchQuery, sizeof(g_appSearchQuery));
+    
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_appResolverRunning);
+    if (ImGui::Button("Refresh")) {
+        g_appResolverRunning = false; // Kill signal for current thread
+        g_appListLoading = false;     // Trigger re-fetch
+        g_selectedAppPackage = "";    // Clear selection
+    }
+    ImGui::EndDisabled();
+
+    // --- Fetch Logic ---
+    if (!g_appListLoading) {
+        // Wait a tiny bit for thread to see kill signal if possible, or just ignore
+        {
+            std::lock_guard<std::mutex> lock(g_appMutex);
+            g_appList.clear(); 
+            g_appList = AdbManager::ListApps(dev.serial, g_includeSystemApps);
+        }
+        if (!g_appResolverRunning) {
+            std::thread(AppResolverThread, dev.serial).detach();
+        }
+        g_appListLoading = true;
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
+
+    // --- Table ---
+    if (ImGui::BeginTable("##app_table", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable, ImVec2(0, panelH - 180.0f))) {
+        ImGui::TableSetupColumn("App / Package ID", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableHeadersRow();
+
+        int rowIdx = 0;
+        
+        // Lock and copy or iterate carefully
+        std::vector<AdbManager::AppInfo> displayList;
+        {
+            std::lock_guard<std::mutex> lock(g_appMutex);
+            displayList = g_appList;
+        }
+
+        for (const auto& app : displayList) {
+            // Search Filter
+            if (g_appSearchQuery[0] != '\0') {
+                std::string idLower = app.packageId;
+                std::string nameLower = app.name;
+                std::string searchLower = g_appSearchQuery;
+                std::transform(idLower.begin(), idLower.end(), idLower.begin(), ::tolower);
+                std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+                std::transform(searchLower.begin(), searchLower.end(), searchLower.begin(), ::tolower);
+                if (idLower.find(searchLower) == std::string::npos && nameLower.find(searchLower) == std::string::npos) continue;
+            }
+
+            ImGui::PushID(app.packageId.c_str());
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            
+            // Icon + Label
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 cp = ImGui::GetCursorScreenPos();
+            
+            DrawAppIcon(dl, ImVec2(cp.x, cp.y + 4.0f), app.packageId, app.isSystem);
+            
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 28.0f);
+            bool selected = (g_selectedAppPackage == app.packageId);
+            
+            // Use Selectable as the ID anchor for the whole row
+            if (ImGui::Selectable("##select", selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, ImVec2(0, 36.0f))) {
+                g_selectedAppPackage = app.packageId;
+            }
+
+            // --- Context Menu ---
+            if (ImGui::BeginPopupContextItem("AppCtx")) {
+                g_selectedAppPackage = app.packageId;
+                if (ImGui::MenuItem("Open on Phone")) {
+                    AdbManager::LaunchApp(dev.serial, app.packageId);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Backup APK to PC")) {
+                    std::string local = SaveLocalFile(app.packageId + ".apk");
+                    if (!local.empty()) {
+                        AdbManager::PullFile(dev.serial, app.apkPath, local);
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Uninstall App", nullptr, false, !app.isSystem)) {
+                    g_showUninstallPopup = true;
+                }
+                ImGui::EndPopup();
+            }
+
+            // Overlay the app info on top of the selectable
+            ImGui::SetCursorScreenPos(ImVec2(cp.x + 28.0f, cp.y));
+            ImGui::BeginGroup();
+            if (g_fontBold) ImGui::PushFont(g_fontBold);
+            ImGui::Text("%s", app.name.c_str());
+            if (g_fontBold) ImGui::PopFont();
+            
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 5.0f); // Nudge up to prevent overlap
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.6f, 1.0f));
+            ImGui::Text("%s", app.packageId.c_str());
+            ImGui::PopStyleColor();
+            ImGui::EndGroup();
+
+            ImGui::TableNextColumn();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
+            ImGui::Text("%s", app.version.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 8.0f);
+            ImGui::TextColored(app.isSystem ? ImVec4(0.5f, 0.5f, 0.6f, 1.0f) : ImVec4(0.35f, 0.8f, 0.44f, 1.0f), 
+                "%s", app.isSystem ? "System" : "User");
+            
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // --- Action Bar ---
+    ImGui::SetCursorPos(ImVec2(24.0f, panelH - 50.0f));
+    if (ImGui::Button("Backup APK") && !g_selectedAppPackage.empty()) {
+        std::string local = SaveLocalFile(g_selectedAppPackage + ".apk");
+        if (!local.empty()) {
+            std::string apkPath;
+            {
+               std::lock_guard<std::mutex> lock(g_appMutex);
+               for(auto& a : g_appList) if(a.packageId == g_selectedAppPackage) apkPath = a.apkPath;
+            }
+            if(!apkPath.empty()) AdbManager::PullFile(dev.serial, apkPath, local);
+        }
+    }
+    
+    ImGui::SameLine();
+    if (ImGui::Button("Install APK...")) {
+        std::string apk = PickLocalFile(); // We can add ".apk" filter logic if needed
+        if (!apk.empty()) {
+            g_appStatusMessage = "Installing APK...";
+            if (AdbManager::InstallApp(dev.serial, apk)) {
+                g_appStatusMessage = "Installation Successful!";
+                g_appListLoading = false; // Refresh
+            } else {
+                g_appStatusMessage = "Installation Failed!";
+            }
+            g_appStatusTimer = 5.0f; // Show for 5 seconds
+        }
+    }
+
+    if (g_appStatusTimer > 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.35f, 0.8f, 0.44f, 1.0f), "%s", g_appStatusMessage.c_str());
+        g_appStatusTimer -= ImGui::GetIO().DeltaTime;
+    }
+
+    if (g_appResolverRunning) {
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(panelW - 320.0f);
+        ImGui::TextColored(ImVec4(0.35f, 0.43f, 0.96f, 1.0f), "Syncing app details...");
+    }
+    
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(panelW - 100.0f);
+    if (ImGui::Button("Uninstall") && !g_selectedAppPackage.empty()) {
+        g_showUninstallPopup = true;
+    }
+
+    // --- Modals ---
+    if (g_showUninstallPopup) ImGui::OpenPopup("Confirm Uninstall");
+    if (ImGui::BeginPopupModal("Confirm Uninstall", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Are you sure you want to uninstall this application?");
+        ImGui::TextColored(ImVec4(0.91f, 0.3f, 0.24f, 1.0f), "%s", g_selectedAppPackage.c_str());
+        ImGui::Separator();
+        if (ImGui::Button("Uninstall", ImVec2(120, 0))) {
+            if (AdbManager::UninstallApp(dev.serial, g_selectedAppPackage)) {
+                g_appListLoading = false;
+                g_selectedAppPackage = "";
+            }
+            g_showUninstallPopup = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            g_showUninstallPopup = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
 }
 
 
@@ -910,7 +1205,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
 
     if (g_activeTab == 0) RenderHomePanel(devices, panelW, contentH);
     else if (g_activeTab == 1) RenderFilePanel(devices, panelW, contentH);
-    else if (g_activeTab == 2) RenderComingSoonPanel("Backup & Restore", panelW, contentH);
+    else if (g_activeTab == 2) RenderAppsPanel(devices, panelW, contentH);
     else if (g_activeTab == 3) RenderComingSoonPanel("Wall-E Settings", panelW, contentH);
 
     ImGui::EndChild();
