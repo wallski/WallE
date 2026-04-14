@@ -1145,6 +1145,7 @@ static void RenderLivePanel(const DeviceInfo &dev, float panelW, float panelH) {
     if (g_fontBold) ImGui::PopFont();
 
     ID3D11ShaderResourceView* srv = g_mirror.GetFrameSRV();
+    //OutputDebugStringA(g_mirror.IsRunning() ? "Mirror running\n" : "Mirror NOT running\n");
     if (srv) {
         g_mirrorWatchdog = -1.0f; // Live!
         float aspect = g_mirror.GetAspectRatio();
