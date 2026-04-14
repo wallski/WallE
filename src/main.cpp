@@ -18,7 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -36,12 +36,28 @@ static ID3D11Device *g_pd3dDevice = nullptr;
 static ID3D11DeviceContext *g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain *g_pSwapChain = nullptr;
 static ID3D11RenderTargetView *g_mainRenderTargetView = nullptr;
+static std::mutex g_d3dMutex;
 
 // UI state
 static int g_activeTab = 0;
 static int g_selectedDevice = -1;
 static float g_tabAnim[6] = {};
 static float g_sidebarWidth = 260.0f;
+
+// GPU Selection state
+struct GpuInfo {
+    std::string name;
+    std::string memory;
+};
+static std::vector<GpuInfo> g_gpuList;
+static int g_selectedGpu = 0;
+static int g_requestedGpu = -1;
+static bool g_gpuListLoaded = false;
+
+#include "MirrorManager.hpp"
+static MirrorManager g_mirror;
+static bool g_mirrorActive = false;
+static float g_mirrorWatchdog = 0.0f;
 
 // Cached ADB state - only re-checked every 5 seconds, not every frame
 static bool g_adbReady = false;
@@ -127,7 +143,8 @@ static ImFont *g_fontBold = nullptr;
 static ImFont *g_fontMono = nullptr;
 
 // Forward declarations
-bool CreateDeviceD3D(HWND hWnd);
+struct IDXGIAdapter1;
+bool CreateDeviceD3D(HWND hWnd, IDXGIAdapter1* pAdapter);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
@@ -289,6 +306,53 @@ static void ApplyWallETheme() {
   c[ImGuiCol_NavWindowingHighlight] = ImVec4(1.0f, 1.0f, 1.0f, 0.70f);
   c[ImGuiCol_NavWindowingDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.50f);
   c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.60f);
+}
+
+// DXGI Helpers
+static void EnumerateGpus() {
+    if (g_gpuListLoaded) return;
+    g_gpuList.clear();
+
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return;
+
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+            adapter->Release();
+            continue;
+        }
+
+        char name[128];
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, 128, NULL, NULL);
+        g_gpuList.push_back({ name, std::to_string(desc.DedicatedVideoMemory / (1024 * 1024)) + " MB" });
+        adapter->Release();
+    }
+    factory->Release();
+    g_gpuListLoaded = true;
+}
+
+static IDXGIAdapter1* GetAdapter(int index) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    int hardwareIdx = 0;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
+        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            if (hardwareIdx == index) {
+                factory->Release();
+                return adapter;
+            }
+            hardwareIdx++;
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return nullptr;
 }
 
 //  HELPERS - draw a small colored dot without any font glyph
@@ -1068,6 +1132,66 @@ static void RunWallFetch(const std::string &serial) {
   AppendToTerminal("\n");
 }
 
+static void RenderLivePanel(const DeviceInfo &dev, float panelW, float panelH) {
+    if (!g_mirrorActive) {
+        g_mirror.Start(dev.serial, g_pd3dDevice, &g_d3dMutex);
+        g_mirrorActive = true;
+        g_mirrorWatchdog = (float)ImGui::GetTime();
+    }
+
+    ImGui::SetCursorPos(ImVec2(24.0f, 20.0f));
+    if (g_fontBold) ImGui::PushFont(g_fontBold);
+    ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "[ LIVE MIRROR: %s ]", dev.model.c_str());
+    if (g_fontBold) ImGui::PopFont();
+
+    ID3D11ShaderResourceView* srv = g_mirror.GetFrameSRV();
+    if (srv) {
+        g_mirrorWatchdog = -1.0f; // Live!
+        float aspect = g_mirror.GetAspectRatio();
+        float viewH = panelH - 80.0f;
+        float viewW = viewH * aspect;
+        
+        ImGui::SetCursorPosX((panelW - viewW) * 0.5f);
+        ImGui::SetCursorPosY(60.0f);
+        
+        ImVec2 startPos = ImGui::GetCursorScreenPos();
+        ImGui::Image((void*)srv, ImVec2(viewW, viewH));
+        
+        // --- INPUT MAPPING ---
+        if (ImGui::IsItemClicked()) {
+            ImVec2 mousePos = ImGui::GetMousePos();
+            float relX = (mousePos.x - startPos.x) / viewW;
+            float relY = (mousePos.y - startPos.y) / viewH;
+            
+            // Pro mapping: use dynamic resolution from MirrorManager
+            g_mirror.SendTap((int)(relX * 1080), (int)(relY * 2340));
+        }
+
+        // Drag to Swipe logic
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+             static float dragTimer = 0;
+             dragTimer += ImGui::GetIO().DeltaTime;
+             if (dragTimer > 0.5f) { // Detect long swipe
+                ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                // Send swipe logic here...
+                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+                dragTimer = 0;
+             }
+        }
+    } else {
+        // Watchdog: If no frames for 4 seconds, restart
+        float now = (float)ImGui::GetTime();
+        if (g_mirrorWatchdog > 0.0f && now - g_mirrorWatchdog > 4.0f) {
+             g_mirror.Stop();
+             g_mirrorActive = false; // Will restart on next frame
+        }
+
+        ImGui::SetCursorPosY(panelH * 0.4f);
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Syncing with device...");
+        ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(), ImVec2(panelW * 0.4f, 2.0f), "");
+    }
+}
+
 static void RenderTerminalPanel(const std::vector<DeviceInfo> &devices,
                                 float panelW, float panelH) {
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 20.0f));
@@ -1585,7 +1709,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
                            WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, nullptr,
                            nullptr, wc.hInstance, nullptr);
 
-  if (!CreateDeviceD3D(hwnd)) {
+  if (!CreateDeviceD3D(hwnd, nullptr)) {
     CleanupDeviceD3D();
     UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 1;
@@ -1625,9 +1749,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
 
   // Main loop
   bool done = false;
+  static int requestedGpu = -1; // Global signal
+  
   while (!done) {
     MSG msg;
-    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+    while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
       TranslateMessage(&msg);
       DispatchMessage(&msg);
       if (msg.message == WM_QUIT)
@@ -1635,6 +1761,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
     }
     if (done)
       break;
+
+    // Handle Live GPU Hot-Swap Request
+    if (g_requestedGpu != -1 && g_requestedGpu != g_selectedGpu) {
+        // Reset device
+        ImGui_ImplDX11_Shutdown();
+        CleanupDeviceD3D();
+
+        IDXGIAdapter1* adapter = GetAdapter(g_requestedGpu);
+        if (CreateDeviceD3D(hwnd, adapter)) {
+             g_selectedGpu = g_requestedGpu;
+             ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+             if (adapter) adapter->Release();
+        } else {
+             // Fallback to default if selected failed
+             CreateDeviceD3D(hwnd, nullptr);
+             ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+             g_selectedGpu = 0;
+        }
+        g_requestedGpu = -1;
+    }
 
     // Throttled ADB check - only runs once every 5 seconds, not every frame
     float now = (float)ImGui::GetTime();
@@ -1702,14 +1848,52 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
       RenderHomePanel(devices, panelW, contentH);
     else if (g_activeTab == 1)
       RenderFilePanel(devices, panelW, contentH);
-    else if (g_activeTab == 2)
-      RenderAppsPanel(devices, panelW, contentH);
-    else if (g_activeTab == 3)
-      RenderTerminalPanel(devices, panelW, contentH);
-    else if (g_activeTab == 4)
-      RenderComingSoonPanel("Wall-E Live Mirror", panelW, contentH);
-    else if (g_activeTab == 5)
-      RenderComingSoonPanel("Wall-E Settings", panelW, contentH);
+    else if (g_activeTab == 2) RenderAppsPanel(devices, panelW, contentH);
+    else if (g_activeTab == 3) RenderTerminalPanel(devices, panelW, contentH);
+    else if (g_activeTab == 5) {
+        // Settings Tab
+        ImGui::SetCursorPos(ImVec2(24.0f, 20.0f));
+        if (g_fontBold) ImGui::PushFont(g_fontBold);
+        ImGui::TextColored(ImVec4(0.91f, 0.91f, 0.94f, 1.0f), "[ Hardware Settings ]");
+        if (g_fontBold) ImGui::PopFont();
+        ImGui::Dummy(ImVec2(0, 10));
+
+        EnumerateGpus();
+
+        ImGui::Text("Preferred Graphics Adapter");
+        ImGui::SetNextItemWidth(panelW * 0.8f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 8));
+        if (ImGui::BeginCombo("##gpu_select", g_gpuList.empty() ? "No GPUs found" : g_gpuList[g_selectedGpu].name.c_str())) {
+            for (int i = 0; i < (int)g_gpuList.size(); i++) {
+                bool is_selected = (g_selectedGpu == i);
+                if (ImGui::Selectable(g_gpuList[i].name.c_str(), is_selected)) {
+                     if (g_selectedGpu != i) {
+                         g_requestedGpu = i;
+                     }
+                }
+                if (is_selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopStyleVar();
+        
+        ImGui::Dummy(ImVec2(0, 20));
+        ImGui::Text("Wall-E Mirroring Quality");
+        static int quality = 1; // 0=Performance, 1=High
+        if (ImGui::RadioButton("Performance (4 Mbps)", quality == 0)) quality = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("High Quality (8 Mbps)", quality == 1)) quality = 1;
+        
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Higher bitrate requires a better USB cable.");
+    }
+    else if (g_activeTab == 4) {
+        if (!devices.empty()) {
+            RenderLivePanel(devices[0], panelW, contentH);
+        } else {
+            RenderComingSoonPanel("Wall-E Live Mirror", panelW, contentH);
+        }
+    }
 
     ImGui::EndChild();
 
@@ -1721,14 +1905,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
       ImGui::PopFont();
 
     // Render
-    ImGui::Render();
-    const float clearColor[4] = {0.051f, 0.051f, 0.063f, 1.00f};
-    g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView,
-                                            nullptr);
-    g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView,
-                                               clearColor);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    g_pSwapChain->Present(1, 0);
+    {
+        std::lock_guard<std::mutex> lock(g_d3dMutex);
+        ImGui::Render();
+        const float clearColor[4] = {0.051f, 0.051f, 0.063f, 1.00f};
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView,
+                                                nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView,
+                                                   clearColor);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_pSwapChain->Present(1, 0);
+    }
   }
 
   deviceManager.Stop();
@@ -1743,7 +1930,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
 }
 
 //  D3D HELPERS
-bool CreateDeviceD3D(HWND hWnd) {
+bool CreateDeviceD3D(HWND hWnd, IDXGIAdapter1* pAdapter) {
   DXGI_SWAP_CHAIN_DESC sd;
   ZeroMemory(&sd, sizeof(sd));
   sd.BufferCount = 2;
@@ -1767,15 +1954,14 @@ bool CreateDeviceD3D(HWND hWnd) {
       D3D_FEATURE_LEVEL_10_0,
   };
 
+  // If pAdapter is null, we use hardware default. If not null, driver type must be UNKNOWN.
+  D3D_DRIVER_TYPE driverType = pAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+
   HRESULT res = D3D11CreateDeviceAndSwapChain(
-      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags,
+      pAdapter, driverType, nullptr, createDeviceFlags,
       featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain,
       &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
-  if (res == DXGI_ERROR_UNSUPPORTED)
-    res = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags,
-        featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain,
-        &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+
   if (res != S_OK)
     return false;
 

@@ -139,6 +139,7 @@
     <ClCompile Include="ext\imgui\imgui_widgets.cpp" />
     <ClCompile Include="src\AdbManager.cpp.cpp" />
     <ClCompile Include="src\DeviceManager.cpp" />
+    <ClCompile Include="src\MirrorManager.cpp" />
     <ClCompile Include="src\main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -159,6 +160,7 @@
     <ClInclude Include="ext\imgui\imstb_truetype.h" />
     <ClInclude Include="include\AdbManager.hpp" />
     <ClInclude Include="include\DeviceManager.hpp" />
+    <ClInclude Include="include\MirrorManager.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
